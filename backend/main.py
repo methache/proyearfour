@@ -18,14 +18,14 @@ LLM Function Calling:
 
 import os
 import json
-import uuid
 import asyncio
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -86,10 +86,7 @@ class RegimeRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
-    message:     str  = Field(...,  min_length=1, max_length=4000, description="ข้อความจากผู้ใช้")
-    model:       str  = Field("gpt-4o-mini", description="ชื่อ LLM model")
-    api_key:     str | None = Field(None, description="OpenAI API key (ถ้าไม่ใส่ ใช้ ENV)")
-    base_url:    str | None = Field(None, description="base_url สำหรับ Ollama หรือ Azure")
+    message:     str  = Field(...,  description="ข้อความจากผู้ใช้")
     history:     list[dict] = Field(default_factory=list, description="ประวัติการสนทนา")
 
 class ChatResponse(BaseModel):
@@ -103,71 +100,154 @@ class ChatResponse(BaseModel):
 # ─────────────────────────────────────────────
 
 TOOLS = [
-    {"type": "function", "function": {
-        "name": "run_data_pipeline",
-        "description": "ดึงข้อมูลราคาหุ้น US, Thai, Bonds จาก Yahoo Finance แปลงเป็น THB และทำ data cleaning ก่อนการวิเคราะห์",
-        "parameters": {"type": "object", "properties": {
-            "start_date": {"type": "string", "description": "วันเริ่มต้น รูปแบบ YYYY-MM-DD เช่น 2020-01-01"},
-            "end_date":   {"type": "string", "description": "วันสิ้นสุด รูปแบบ YYYY-MM-DD"},
-        }, "required": []}}},
-    {"type": "function", "function": {
-        "name": "optimize_portfolio",
-        "description": "คำนวณพอร์ตการลงทุนที่เหมาะสมที่สุดด้วย Modern Portfolio Theory (MPT) หา Sharpe Ratio สูงสุด หรือ Volatility ต่ำสุด หรือ Return สูงสุด พร้อม Efficient Frontier และ Monte Carlo Simulation",
-        "parameters": {"type": "object", "properties": {
-            "objective": {"type": "string", "enum": ["max_sharpe", "min_vol", "max_return"], "description": "เป้าหมายการ optimize"},
-            "top_n":     {"type": "integer", "description": "จำนวนสินทรัพย์ที่ต้องการใช้ (เลือก top N จาก Sharpe สูงสุด)"},
-        }, "required": []}}},
-    {"type": "function", "function": {
-        "name": "classify_market_regime",
-        "description": "วิเคราะห์และจำแนกสภาวะตลาดปัจจุบัน (Bull/Bear/Neutral) ด้วย Random Forest โดยใช้ข้อมูลย้อนหลัง",
-        "parameters": {"type": "object", "properties": {
-            "model_type": {"type": "string", "enum": ["random_forest", "gradient_boosting"], "description": "ประเภทโมเดล ML ที่ต้องการใช้"},
-        }, "required": []}}},
-    {"type": "function", "function": {
-        "name": "get_portfolio_summary",
-        "description": "ดึงผลการคำนวณพอร์ตล่าสุด (น้ำหนักสินทรัพย์, Sharpe, Return, Volatility)",
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {
-        "name": "get_regime_summary",
-        "description": "ดึงสภาวะตลาดล่าสุดพร้อม probability (Bull/Neutral/Bear)",
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {
-        "name": "get_live_quotes",
-        "description": "ดึงราคาสดล่าสุด (THB) และ % เปลี่ยนแปลง 1 วันของสินทรัพย์ 25 ตัว พร้อมอัตรา FX บาท/ดอลลาร์",
-        "parameters": {"type": "object", "properties": {
-            "tickers": {"type": "array", "items": {"type": "string"}, "description": "รายชื่อ ticker ที่ต้องการ เช่น ['AAPL','PTT.BK'] (ว่าง = ทั้งหมด)"},
-        }, "required": []}}},
-    {"type": "function", "function": {
-        "name": "get_stock_news",
-        "description": "ดึงข่าวล่าสุดจาก Yahoo Finance ของหุ้นในระบบ หรือของ ticker ที่ระบุ",
-        "parameters": {"type": "object", "properties": {
-            "ticker": {"type": "string", "description": "ticker เช่น NVDA (ว่าง = ข่าวรวมทุกตัว)"},
-            "limit":  {"type": "integer", "description": "จำนวนข่าวสูงสุด (default 8)"},
-        }, "required": []}}},
-    {"type": "function", "function": {
-        "name": "get_latest_prices",
-        "description": "ดึงราคาสินทรัพย์ล่าสุด (หน่วย THB) พร้อม daily return",
-        "parameters": {"type": "object", "properties": {
-            "n_rows": {"type": "integer", "description": "จำนวนวันย้อนหลังที่ต้องการดู (default 5)"},
-        }, "required": []}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "run_data_pipeline",
+            "description": (
+                "ดึงข้อมูลราคาหุ้น US, Thai, Bonds จาก Yahoo Finance "
+                "แปลงเป็น THB และทำ data cleaning ก่อนการวิเคราะห์"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {
+                        "type": "string",
+                        "description": "วันเริ่มต้น รูปแบบ YYYY-MM-DD เช่น 2020-01-01",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "วันสิ้นสุด รูปแบบ YYYY-MM-DD",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimize_portfolio",
+            "description": (
+                "คำนวณน้ำหนักพอร์ตด้วย MPT จากผลตอบแทนย้อนหลัง เพื่อหา Sharpe สูงสุด, volatility ต่ำสุด หรือ return สูงสุด"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "enum": ["max_sharpe", "min_vol", "max_return"],
+                        "description": "เป้าหมายการ optimize",
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "จำนวนสินทรัพย์ที่ต้องการใช้ (เลือก top N จาก Sharpe สูงสุด)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "classify_market_regime",
+            "description": (
+                "วิเคราะห์และจำแนกสภาวะตลาดปัจจุบัน (Bull/Bear/Neutral) "
+                "ด้วย Random Forest โดยใช้ข้อมูลย้อนหลัง"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_type": {
+                        "type": "string",
+                        "enum": ["random_forest", "gradient_boosting"],
+                        "description": "ประเภทโมเดล ML ที่ต้องการใช้",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_portfolio_summary",
+            "description": "อ่านพอร์ต MPT ที่บันทึกเป็นพอร์ตหลักอยู่ในขณะนี้เท่านั้น; ถ้าผู้ใช้ขอเป้าหมายอื่น เช่น Min Volatility หรือ Max Return ให้เรียก optimize_portfolio แทน",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_regime_summary",
+            "description": "ดึงสภาวะตลาดล่าสุดพร้อม probability (Bull/Neutral/Bear)",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_latest_prices",
+            "description": "ดึงราคาสินทรัพย์ล่าสุด (หน่วย THB) พร้อม daily return",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n_rows": {
+                        "type": "integer",
+                        "description": "จำนวนวันย้อนหลังที่ต้องการดู (default 5)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_backtest_results",
+            "description": "ดึงผล backtest จริงเพื่อเปรียบเทียบ Buy & Hold, MPT และ Regime-Based",
+            "parameters": {"type": "object", "properties": {
+                "period": {"type": "string", "enum": ["1y", "3y", "all"]}}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_mpt_analysis",
+            "description": "ดึงผลวิเคราะห์ MPT จริง เช่น optimal weights, return, volatility, Sharpe และ efficient frontier",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_regime_analysis",
+            "description": "ดึง regime ล่าสุดและสถิติย้อนหลังจากข้อมูลจริง",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_live_market_data",
+            "description": "ดึงราคาปิดล่าสุดและเปอร์เซ็นต์เปลี่ยนแปลงจาก Yahoo Finance API (ข้อมูลสดมี cache 60 วินาที) สำหรับหุ้นที่ระบบติดตาม",
+            "parameters": {"type": "object", "properties": {
+                "tickers": {"type": "array", "items": {"type": "string"},
+                            "description": "สัญลักษณ์หุ้นที่ถาม เช่น AAPL หรือ PTT.BK"}}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_market_news",
+            "description": "ดึงข่าวหุ้นล่าสุดจาก Yahoo Finance API สำหรับหุ้นที่ระบบติดตาม ใช้เมื่อผู้ใช้ถามข่าวหรือบริบทล่าสุด",
+            "parameters": {"type": "object", "properties": {
+                "ticker": {"type": "string", "description": "สัญลักษณ์หุ้นที่ต้องการกรองข่าว เช่น NVDA"}}, "required": []},
+        },
+    },
 ]
 
-# ── คำสั่งระบบที่กำหนดพฤติกรรมของ AI ──
-SYSTEM_PROMPT = (
-    "คุณคือ Quantix AI ผู้ช่วยด้านการลงทุนในแอป Quantix Portfolio System ตอบเป็นภาษาไทยเสมอ "
-    "(ถ้าผู้ใช้พิมพ์ภาษาอื่นให้ตอบภาษานั้น) กระชับ ชัดเจน ใช้ markdown ได้ (ห้ามใช้ LaTeX ให้เขียนสูตรเป็นข้อความธรรมดา)\n"
-    "ขอบเขต: ตอบได้ทุกคำถามที่เกี่ยวกับการลงทุนและการเงิน เช่น หุ้นไทย/ต่างประเทศ กองทุน ETF พันธบัตร ทองคำ คริปโต "
-    "เศรษฐกิจมหภาค ดอกเบี้ย ภาษีการลงทุน การวางแผนการเงิน การวิเคราะห์ปัจจัยพื้นฐาน/เทคนิค ความเสี่ยง "
-    "ทฤษฎีพอร์ต (MPT, Sharpe) และวิธีใช้ฟีเจอร์ในแอปนี้\n"
-    "ถ้าคำถามไม่เกี่ยวกับการลงทุนหรือการเงิน ให้ปฏิเสธอย่างสุภาพสั้นๆ ว่าตอบได้เฉพาะเรื่องการลงทุน "
-    "แล้วเสนอตัวอย่างคำถามด้านการลงทุน 2-3 ข้อ — ห้ามตอบเนื้อหานอกขอบเขต\n"
-    "ข้อมูลในระบบ: สินทรัพย์ 25 ตัว (หุ้น US, หุ้นไทย .BK, ETF พันธบัตร, ทองคำ) ราคาเป็นบาท "
-    "เมื่อคำถามเกี่ยวกับพอร์ต ราคา สภาวะตลาด หรือข่าว ให้เรียก tools เพื่อใช้ข้อมูลจริงก่อนตอบ "
-    "(ใช้ get_live_quotes / get_portfolio_summary / get_regime_summary / get_stock_news ก่อนเสมอ "
-    "ห้ามเรียก run_data_pipeline, optimize_portfolio หรือ classify_market_regime เว้นแต่ผู้ใช้ขอให้อัปเดตข้อมูล/คำนวณใหม่ชัดเจน) "
-    "ถ้าไม่มีข้อมูลใน tools ให้ตอบจากความรู้ทั่วไปและบอกว่าข้อมูลอาจไม่เป็นปัจจุบัน ห้ามแต่งตัวเลข\n"
-    "เมื่อให้คำแนะนำการลงทุน ให้ลงท้ายสั้นๆ ว่าเป็นข้อมูลเพื่อการศึกษา ไม่ใช่คำแนะนำการลงทุน"
-)
 
 # ─────────────────────────────────────────────
 # TOOL EXECUTION
@@ -179,41 +259,70 @@ async def execute_tool(name: str, args: dict) -> dict:
     if name == "run_data_pipeline":
         from yh import run_pipeline
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: run_pipeline(
-            start=args.get("start_date", "2020-01-01"),
-            end=args.get("end_date", datetime.today().strftime("%Y-%m-%d")),
-        ))
-        return {"status": "success", "rows": len(result), "assets": len(result.columns),
-                "message": f"ดึงข้อมูลสำเร็จ {len(result.columns)} สินทรัพย์ {len(result)} วัน"}
+        result = await loop.run_in_executor(
+            None,
+            lambda: run_pipeline(
+                start=args.get("start_date", "2020-01-01"),
+                end=args.get("end_date", datetime.today().strftime("%Y-%m-%d")),
+            )
+        )
+        return {
+            "status": "success",
+            "rows": len(result),
+            "assets": len(result.columns),
+            "message": f"ดึงข้อมูลสำเร็จ {len(result.columns)} สินทรัพย์ {len(result)} วัน",
+        }
 
     elif name == "optimize_portfolio":
-        from mpt import run_mpt
+        from mpt import load_returns, optimize_portfolio
+
+        def _optimize_for_chat():
+            returns = load_returns()
+            top_n = args.get("top_n")
+            if top_n and top_n < len(returns.columns):
+                from mpt import RISK_FREE_RATE, TRADING_DAYS
+                individual_sharpe = (
+                    (returns.mean() * TRADING_DAYS - RISK_FREE_RATE)
+                    / (returns.std() * (TRADING_DAYS ** 0.5))
+                )
+                returns = returns[individual_sharpe.nlargest(top_n).index.tolist()]
+            return optimize_portfolio(
+                returns.mean(), returns.cov(),
+                objective=args.get("objective", "max_sharpe"),
+            )
+
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: run_mpt(
-            objective=args.get("objective", "max_sharpe"), top_n=args.get("top_n")))
-        opt = result["optimal_portfolio"]
+        opt = await loop.run_in_executor(None, _optimize_for_chat)
         top5 = sorted(opt["weights"].items(), key=lambda x: -x[1])[:5]
         return {
-            "status": "success", "objective": opt["objective"],
+            "source": "output/daily_returns.csv",
+            "as_of": str(load_returns().index[-1].date()),
+            "status":                "success",
+            "objective":             opt["objective"],
             "sharpe_ratio":          round(float(opt["sharpe_ratio"]), 4),
             "annualized_return":     round(float(opt["annualized_return"]), 4),
             "annualized_volatility": round(float(opt["annualized_volatility"]), 4),
             "top5_weights":          {t: round(w * 100, 4) for t, w in top5},
             "all_weights":           {t: round(w, 6) for t, w in opt["weights"].items()},
-            "monte_carlo_best_sharpe": result["monte_carlo_summary"]["best_sharpe_mc"],
         }
 
     elif name == "classify_market_regime":
         from regime import run_regime
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: run_regime(
-            model_type=args.get("model_type", "random_forest")))
+        result = await loop.run_in_executor(
+            None,
+            lambda: run_regime(model_type=args.get("model_type", "random_forest"))
+        )
         curr = result["current_regime"]
-        return {"status": "success", "date": curr["date"], "regime": curr["regime_label"],
-                "prob_bull": round(float(curr["prob_bull"]), 4),
-                "prob_neutral": round(float(curr["prob_neutral"]), 4),
-                "prob_bear": round(float(curr["prob_bear"]), 4),
-                "cv_f1": result["cv_f1_mean"]}
+        return {
+            "status":       "success",
+            "date":         curr["date"],
+            "regime":       curr["regime_label"],
+            "prob_bull":    round(float(curr["prob_bull"]), 4),
+            "prob_neutral": round(float(curr["prob_neutral"]), 4),
+            "prob_bear":    round(float(curr["prob_bear"]), 4),
+            "cv_f1":        result["cv_f1_mean"],
+        }
 
     elif name == "get_portfolio_summary":
         csv = OUTPUT_DIR / "optimal_portfolio.csv"
@@ -221,11 +330,13 @@ async def execute_tool(name: str, args: dict) -> dict:
             return {"status": "error", "message": "ยังไม่มีข้อมูล กรุณารัน optimize_portfolio ก่อน"}
         df = pd.read_csv(csv)
         row = df.iloc[0].to_dict()
+        # parse weights — CSV stored dict with numpy wrappers like {'AAPL': np.float64(0.1)}
         import re
         raw = row.get("weights", "") or ""
         weights = {t: float(v) for t, v in re.findall(r"'([^']+)':\s*(?:np\.float64\()?(-?[\d.]+)", raw)}
         top5 = sorted(weights.items(), key=lambda x: -x[1])[:5]
         return {
+            "objective":             row.get("objective", "max_sharpe"),
             "sharpe_ratio":          round(float(row.get("sharpe_ratio", 0)), 4),
             "annualized_return":     round(float(row.get("annualized_return", 0)), 4),
             "annualized_volatility": round(float(row.get("annualized_volatility", 0)), 4),
@@ -239,10 +350,13 @@ async def execute_tool(name: str, args: dict) -> dict:
             return {"status": "error", "message": "ยังไม่มีข้อมูล กรุณารัน classify_market_regime ก่อน"}
         df = pd.read_csv(csv, index_col=0, parse_dates=True)
         latest = df.iloc[-1]
-        return {"date": str(df.index[-1].date()), "regime": latest["regime_label"],
-                "prob_bull": round(float(latest["prob_bull"]), 4),
-                "prob_neutral": round(float(latest["prob_neutral"]), 4),
-                "prob_bear": round(float(latest["prob_bear"]), 4)}
+        return {
+            "date":         str(df.index[-1].date()),
+            "regime":       latest["regime_label"],
+            "prob_bull":    round(float(latest["prob_bull"]), 4),
+            "prob_neutral": round(float(latest["prob_neutral"]), 4),
+            "prob_bear":    round(float(latest["prob_bear"]), 4),
+        }
 
     elif name == "get_latest_prices":
         csv = OUTPUT_DIR / "prices_clean_thb.csv"
@@ -251,32 +365,88 @@ async def execute_tool(name: str, args: dict) -> dict:
         n = int(args.get("n_rows", 5))
         df = pd.read_csv(csv, index_col=0, parse_dates=True)
         latest = df.tail(n).round(2)
-        return {"date_range": f"{latest.index[0].date()} → {latest.index[-1].date()}",
-                "prices": latest.iloc[-1].to_dict()}
+        return {
+            "source": "output/prices_clean_thb.csv",
+            "date_range": f"{latest.index[0].date()} → {latest.index[-1].date()}",
+            "as_of": str(latest.index[-1].date()),
+            "prices":     latest.iloc[-1].to_dict(),
+        }
 
-    elif name == "get_live_quotes":
+    elif name == "get_backtest_results":
+        from backtest import run_backtest
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: run_backtest(period=args.get("period", "all")))
+        return {"source": "prices_clean_thb.csv + regime_predictions.csv + optimal_portfolio.csv",
+                **result}
+
+    elif name == "get_mpt_analysis":
+        csv = OUTPUT_DIR / "optimal_portfolio.csv"
+        if not csv.exists():
+            return {"status": "error", "message": "ยังไม่มีผล MPT ในระบบ"}
+        row = pd.read_csv(csv).iloc[0]
+        raw = str(row.get("weights", ""))
+        import re
+        weights = {t: float(v) for t, v in re.findall(r"'([^']+)':\s*(?:np\.float64\()?(-?[\d.eE+]+)", raw)}
+        return {
+            "source": "optimal_portfolio.csv",
+            "as_of": datetime.fromtimestamp(csv.stat().st_mtime).isoformat(),
+            "objective": row.get("objective"), "success": bool(row.get("success", False)),
+            "annualized_return_pct": float(row.get("annualized_return", 0)),
+            "annualized_volatility_pct": float(row.get("annualized_volatility", 0)),
+            "sharpe_ratio": float(row.get("sharpe_ratio", 0)),
+            "weights_pct": {t: round(w * 100, 2) for t, w in sorted(weights.items(), key=lambda x: -x[1]) if w > 0.0001},
+        }
+
+    elif name == "get_regime_analysis":
+        result = await execute_tool("get_regime_summary", {})
+        if result.get("status") == "error":
+            return result
+        return {"source": "regime_predictions.csv", **result}
+
+    elif name == "get_live_market_data":
         from live import get_live_snapshot
-        snap = await get_live_snapshot()
-        want = {t.upper() for t in (args.get("tickers") or [])}
-        keep = lambda d: {k: v for k, v in d.items() if not want or k in want}  # noqa: E731
-        return {"date": snap.get("date"), "status": snap.get("status"),
-                "fx_thb_per_usd": snap.get("fx_thb_per_usd"),
-                "prices_thb": keep(snap.get("prices", {})),
-                "change_1d_pct": keep(snap.get("changes", {}))}
+        try:
+            snapshot = await get_live_snapshot()
+        except Exception:
+            return {"status": "error", "message": "ดึงราคาสดจาก Yahoo Finance ไม่สำเร็จ"}
+        requested = [str(t).strip().upper() for t in args.get("tickers", []) if str(t).strip()]
+        available = snapshot.get("prices", {})
+        selected = requested or sorted(available)
+        quotes = {
+            ticker: {
+                "price_thb": available[ticker],
+                "change_pct": snapshot.get("changes", {}).get(ticker),
+                "as_of": snapshot.get("asof", {}).get(ticker),
+            }
+            for ticker in selected if ticker in available
+        }
+        return {
+            "source": "Yahoo Finance API",
+            "status": snapshot.get("status", "unknown"),
+            "fetched_at": snapshot.get("fetched_at"),
+            "fx_thb_per_usd": snapshot.get("fx_thb_per_usd"),
+            "quotes": quotes,
+            "not_available": [ticker for ticker in selected if ticker not in available],
+        }
 
-    elif name == "get_stock_news":
-        limit = int(args.get("limit") or 8)
-        ticker = (args.get("ticker") or "").upper().strip()
+    elif name == "get_market_news":
+        from news import get_news_snapshot
+        snapshot = await get_news_snapshot()
+        ticker = str(args.get("ticker", "")).strip().upper()
+        items = snapshot["items"]
         if ticker:
-            from news import _fetch_search
-            items = await asyncio.get_running_loop().run_in_executor(None, _fetch_search, ticker)
-        else:
-            from news import get_news
-            items = await get_news()
-        return {"news": [{k: n.get(k) for k in ("ticker", "title", "publisher", "published", "url")} for n in items[:limit]]}
+            items = [item for item in items if item.get("ticker", "").upper() == ticker]
+        return {
+            "source": "Yahoo Finance News API",
+            "status": snapshot["status"],
+            "fetched_at": snapshot["fetched_at"],
+            "ticker_filter": ticker or None,
+            "items": items[:8],
+        }
 
     else:
         return {"status": "error", "message": f"ไม่รู้จัก tool: {name}"}
+
 
 # ─────────────────────────────────────────────
 # ENDPOINTS
@@ -418,79 +588,231 @@ async def api_returns_history(period: str = "1y"):
     return {"period": period, "tickers": all_tickers, "data": records}
 
 
+def _explicit_portfolio_objective(message: str) -> str | None:
+    """Recognize unambiguous optimization requests so they always use MPT."""
+    text = message.lower()
+    min_vol = bool(re.search(
+        r"min[\s_-]*vol|lowest volatility|minimum volatility|volatility.{0,20}(ต่ำ|น้อย)|"
+        r"(ต่ำ|น้อย).{0,20}(volatility|ความผันผวน)|ความผันผวน.{0,20}(ต่ำ|น้อย)|เสี่ยงต่ำสุด",
+        text,
+    ))
+    max_return = bool(re.search(
+        r"max[\s_-]*return|highest return|ผลตอบแทน.{0,20}(สูงสุด|มากที่สุด)|"
+        r"return.{0,20}(สูงสุด|มากที่สุด)", text,
+    ))
+    max_sharpe = bool(re.search(
+        r"max[\s_-]*sharpe|sharpe.{0,20}(สูงสุด|ดีที่สุด)|จัดพอร์ต.{0,30}sharpe",
+        text,
+    ))
+    requested = [name for flag, name in (
+        (min_vol, "min_vol"), (max_return, "max_return"), (max_sharpe, "max_sharpe")
+    ) if flag]
+    return requested[0] if len(requested) == 1 else None
+
+
+def _is_all_tickers_followup(message: str) -> bool:
+    return bool(re.search(r"เอา.{0,8}(ทุกตัว|ทั้งหมด)|ทุกตัว|ทุกหุ้น|หุ้นทั้งหมด|ทั้งหมดเลย", message))
+
+
+def _has_recent_price_question(history: list[dict]) -> bool:
+    for item in history[-8:]:
+        if item.get("role") == "user" and re.search(
+            r"ราคา|ราคาหุ้น|วิเคราะห์.{0,12}หุ้น|หุ้น.{0,12}ราคา|หุ้น.{0,12}วิเคราะห์",
+            str(item.get("content", "")),
+        ):
+            return True
+    return False
+
+
+def _format_live_market_reply(result: dict) -> str:
+    quotes = result.get("quotes") or {}
+    if not quotes:
+        return "ยังไม่พบราคาหุ้นที่ระบบติดตามในผลจาก Yahoo Finance จึงยังสรุปราคาให้ไม่ได้ครับ"
+
+    lines = []
+    for ticker, quote in quotes.items():
+        price = quote.get("price_thb")
+        if price is None:
+            continue
+        line = f"{ticker}: ฿{float(price):,.2f}"
+        change = quote.get("change_pct")
+        if change is not None:
+            line += f" ({float(change):+.2f}%)"
+        if quote.get("as_of"):
+            line += f" ณ {quote['as_of']}"
+        lines.append(line)
+
+    if not lines:
+        return "ผลจาก Yahoo Finance ไม่มีตัวเลขราคาที่ใช้สรุปได้ครับ"
+    stale_note = " สถานะข้อมูลระบุว่าเก่า โปรดดูวันกำกับแต่ละรายการ" if result.get("status") == "stale" else ""
+    return (
+        "ราคาล่าสุดที่ดึงได้จาก Yahoo Finance (แสดงเป็น THB และเปอร์เซ็นต์เปลี่ยนแปลงตามผล API):\n"
+        + "\n".join(lines)
+        + stale_note
+    )
+
+
 @app.post("/api/chat", response_model=ChatResponse)
-async def api_chat(req: ChatRequest, request: Request):
-    from auth import _current_user
-    if not await _current_user(request):
-        raise HTTPException(status_code=401, detail="กรุณาเข้าสู่ระบบก่อนใช้ AI Chat")
+async def api_chat(req: ChatRequest):
+    """
+    LLM chat endpoint พร้อม Function Calling
+    - คำตอบต้องอ้างอิง tool result เท่านั้น; ถ้าไม่มีหลักฐานให้ปฏิเสธการเดา
+    """
     tool_calls_log:   list[dict] = []
     tool_results_log: list[dict] = []
+    # Resolve a short follow-up like “เอาทุกตัว” against the prior price question.
+    # This avoids the model misrouting it to the data pipeline instead of quotes.
+    if _is_all_tickers_followup(req.message) and _has_recent_price_question(req.history):
+        args = {}
+        result = await execute_tool("get_live_market_data", args)
+        tool_calls_log.append({"tool": "get_live_market_data", "args": args})
+        tool_results_log.append({"tool": "get_live_market_data", "result": result})
+        reply = (
+            "ดึงราคาหุ้นทั้งหมดที่ระบบติดตามไม่สำเร็จ จึงยังยืนยันราคาไม่ได้ครับ"
+            if result.get("status") == "error"
+            else _format_live_market_reply(result)
+        )
+        return ChatResponse(reply=reply, tool_calls=tool_calls_log, tool_results=tool_results_log)
 
-    # ── ทาง A: ใช้ AI จริง (GPT-6 Luna ผ่าน Emergent Universal Key) ──
-    if os.environ.get("EMERGENT_LLM_KEY"):
+    objective = _explicit_portfolio_objective(req.message)
+    if objective:
+        args = {"objective": objective}
+        result = await execute_tool("optimize_portfolio", args)
+        tool_calls_log.append({"tool": "optimize_portfolio", "args": args})
+        tool_results_log.append({"tool": "optimize_portfolio", "result": result})
+        if result.get("status") == "error":
+            reply = result.get("message", "MPT คำนวณไม่สำเร็จ")
+        else:
+            names = {
+                "min_vol": "Min Volatility",
+                "max_return": "Max Return",
+                "max_sharpe": "Max Sharpe",
+            }
+            weights = result.get("top5_weights", {})
+            allocation = ", ".join(f"{ticker} {weight:.2f}%" for ticker, weight in weights.items())
+            reply = (
+                f"ผลคำนวณพอร์ต {names[objective]} จากผลตอบแทนย้อนหลังถึง {result.get('as_of', 'ไม่ระบุวันที่')} "
+                f"(หน่วยผลตอบแทน/ความผันผวนเป็นรายปี): Return {result['annualized_return']:.2f}%, "
+                f"Volatility {result['annualized_volatility']:.2f}%, Sharpe {result['sharpe_ratio']:.4f}. "
+                f"น้ำหนักสูงสุด: {allocation}. ผลย้อนหลังไม่รับประกันผลในอนาคต"
+            )
+        return ChatResponse(reply=reply, tool_calls=tool_calls_log, tool_results=tool_results_log)
+
+    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    if provider == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY")
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        model = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite")
+        provider_name = "Gemini"
+    elif provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        model = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        provider_name = "OpenAI"
+    else:
+        return ChatResponse(
+            reply="ตั้งค่า LLM_PROVIDER ไม่ถูกต้อง ใช้ gemini หรือ openai",
+            tool_calls=[], tool_results=[])
+
+    # OpenAI SDK is used as the compatible client for OpenAI and Gemini.
+    if OPENAI_AVAILABLE and api_key:
         try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage
-            history = [
-                {"role": h["role"], "content": str(h.get("content", ""))}
-                for h in req.history[-10:]
-                if h.get("role") in ("user", "assistant") and h.get("content")
-            ]
-            chat = LlmChat(
-                api_key=os.environ["EMERGENT_LLM_KEY"],
-                session_id=f"chat-{uuid.uuid4().hex}",
-                system_message=SYSTEM_PROMPT,
-                initial_messages=[{"role": "system", "content": SYSTEM_PROMPT}, *history],
-            ).with_model("openai", os.environ["LLM_MODEL"]).with_tools(TOOLS, tool_choice="auto")
+            client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=165.0)
+            system_prompt = (
+                "คุณคือผู้ช่วยตอบคำถามเกี่ยวกับข้อมูลลงทุนที่มีอยู่ในระบบ Quantix ตอบภาษาไทยเสมอ. "
+                "ตอบข้อเท็จจริงและตัวเลขได้เฉพาะเมื่อมี tool result รองรับเท่านั้น. "
+                "ห้ามใช้ความรู้ทั่วไป ความจำ หรือคาดเดาตัวเลข/สถานะ/เหตุผลแทนข้อมูลระบบ. "
+                "เมื่อผู้ใช้ขอ Min Volatility ให้เรียก optimize_portfolio ด้วย objective=min_vol; "
+                "เมื่อขอผลตอบแทนสูงสุดใช้ max_return; เมื่อขอ Sharpe สูงสุดใช้ max_sharpe. "
+                "ห้ามสรุปว่าเป้าหมายเหล่านี้ไม่มีในระบบเพียงเพราะ get_portfolio_summary แสดงพอร์ตหลักเป้าหมายเดียว. "
+                "ถ้าถามราคาปัจจุบันหรือการเปลี่ยนแปลง ให้เรียก get_live_market_data; ถ้าถามข่าวล่าสุดให้เรียก get_market_news. "
+                "หากข้อความสั้น เช่น 'เอาทุกตัว' ให้อ่านบริบทก่อนหน้าและเรียกเครื่องมือให้ตรงหัวข้อเดิม; ถ้าหมายถึงราคาหุ้นทั้งหมดที่ระบบติดตาม ให้เรียก get_live_market_data โดยไม่ส่ง tickers. "
+                "วิเคราะห์ข่าวได้เฉพาะจากหัวข้อ/สรุปที่ tool ส่งมา และบอกให้ชัดว่าราคาเป็นราคาปิดล่าสุด ไม่ใช่ราคา tick real-time. "
+                "หากข้อมูลมี status=stale ให้ระบุว่าเป็นข้อมูลเก่า; ห้ามเรียกข้อมูล CSV ว่าราคาสด. "
+                "ถ้าไม่มี tool ที่ตรงคำถาม, tool error, หรือข้อมูลไม่ครอบคลุม ให้บอกชัดว่าไม่มีข้อมูลในระบบและไม่สรุปเอง. "
+                "ระบุวัน/ช่วงข้อมูลและ source เมื่อมีในผลลัพธ์. แยกคำอธิบายวิธีคำนวณออกจากข้อเท็จจริง. "
+                "ผลตอบแทนย้อนหลังหรือผล backtest ไม่ใช่การรับประกันอนาคต."
+            )
+            messages = [{"role": "system", "content": system_prompt}]
+            # Never let client-supplied history add system/developer/tool messages.
+            for item in req.history[-20:]:
+                role = item.get("role")
+                content = item.get("content")
+                if role in {"user", "assistant"} and isinstance(content, str):
+                    messages.append({"role": role, "content": content[:8000]})
+            messages.append({"role": "user", "content": req.message})
 
-            resp = await chat.send_message_with_tools(UserMessage(text=req.message))
-            for _ in range(5):                                   # วนได้สูงสุด 5 รอบ
-                if not resp.tool_calls:
-                    break                                        # AI ได้คำตอบแล้ว
-                for tc in resp.tool_calls:
-                    args = tc.arguments or {}
-                    result = None
-                    for prev_call, prev_res in zip(tool_calls_log, tool_results_log):
-                        if prev_call["tool"] == tc.name and prev_call["args"] == args:
-                            result = prev_res["result"]          # เรียกซ้ำแบบเดิม → ใช้ผลเก่า
-                    if result is None:
-                        tool_calls_log.append({"tool": tc.name, "args": args})
-                        try:
-                            result = await execute_tool(tc.name, args)
-                        except Exception as tool_err:  # noqa: BLE001
-                            result = {"status": "error", "message": str(tool_err)}
-                        tool_results_log.append({"tool": tc.name, "result": result})
-                    chat.add_tool_result(tc.id, json.dumps(result, ensure_ascii=False, default=str))
-                resp = await chat.send_message_with_tools()      # ให้ AI อ่านผลแล้วตอบต่อ
+            resp = await client.chat.completions.create(
+                model=model, messages=messages,
+                tools=TOOLS, tool_choice="auto", max_tokens=512,
+            )
+            msg = resp.choices[0].message
+            messages.append(msg.model_dump(exclude_none=True))
 
-            return ChatResponse(reply=resp.content or "ขออภัยครับ ตอนนี้ยังสรุปคำตอบไม่ได้ ลองถามใหม่อีกครั้ง",
-                                tool_calls=tool_calls_log, tool_results=tool_results_log)
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    fn_name = tc.function.name
+                    fn_args = json.loads(tc.function.arguments or "{}")
+                    tool_calls_log.append({"tool": fn_name, "args": fn_args})
+                    tool_result = await execute_tool(fn_name, fn_args)
+                    tool_results_log.append({"tool": fn_name, "result": tool_result})
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc.id,
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    })
+                failed_tools = [tr for tr in tool_results_log
+                                if tr["result"].get("status") == "error"]
+                if failed_tools:
+                    names = ", ".join(tr["tool"] for tr in failed_tools)
+                    return ChatResponse(
+                        reply=f"ดึงข้อมูลจากระบบไม่สำเร็จ ({names}) จึงยังสรุปคำตอบนี้ไม่ได้",
+                        tool_calls=tool_calls_log, tool_results=tool_results_log)
+                # Tool errors are evidence of missing data, never grounds to improvise.
+                resp2 = await client.chat.completions.create(
+                    model=model, messages=messages, max_tokens=512,
+                )
+                final_reply = (resp2.choices[0].message.content or "").strip()
+                if not final_reply:
+                    live_result = next(
+                        (item["result"] for item in tool_results_log
+                         if item["tool"] == "get_live_market_data"),
+                        None,
+                    )
+                    final_reply = (
+                        _format_live_market_reply(live_result)
+                        if live_result is not None
+                        else "เครื่องมือดึงข้อมูลสำเร็จ แต่โมเดลไม่ได้ส่งข้อความสรุปกลับมา ผลข้อมูลแสดงในการ์ดด้านล่างครับ"
+                    )
+            else:
+                final_reply = ("คำถามนี้ยังไม่มีข้อมูลจากเครื่องมือของระบบมารองรับ "
+                               "จึงไม่สามารถให้ข้อเท็จจริงหรือตัวเลขโดยไม่คาดเดาได้")
+
+            return ChatResponse(reply=final_reply,
+                                tool_calls=tool_calls_log,
+                                tool_results=tool_results_log)
+
         except Exception as llm_err:
             import logging
-            logging.warning("LLM error → rule-based fallback: %s", llm_err)
-            tool_calls_log, tool_results_log = [], []
+            # Provider exceptions may include a masked fragment of the API key.
+            logging.warning("LLM request failed (%s)", type(llm_err).__name__)
+            if type(llm_err).__name__ == "AuthenticationError":
+                return ChatResponse(
+                    reply=f"{provider_name} ปฏิเสธ API key (401) กรุณาตรวจว่า key ในไฟล์ .env ถูกต้อง ยังใช้งานได้ และไม่มีข้อความตัวอย่าง/อัญประกาศ จากนั้นสร้าง backend ใหม่",
+                    tool_calls=tool_calls_log, tool_results=tool_results_log)
+            if type(llm_err).__name__ == "RateLimitError":
+                return ChatResponse(
+                    reply=f"{provider_name} จำกัดคำขอ (429) อาจถึง rate limit, quota หรือ billing limit กรุณาตรวจสอบ usage และ limits ของ API key นี้",
+                    tool_calls=tool_calls_log, tool_results=tool_results_log)
+            return ChatResponse(
+                reply="ขณะนี้ระบบวิเคราะห์คำถามไม่ได้ จึงยังยืนยันข้อมูลให้ไม่ได้ กรุณาลองใหม่ภายหลัง",
+                tool_calls=tool_calls_log, tool_results=tool_results_log)
 
-    # ── ทาง B: AI ใช้งานไม่ได้ → จับคำสำคัญในคำถามแทน ──
-    msg_lower = req.message.lower()
-    keywords_map = {
-        ("portfolio", "mpt", "sharpe", "weight", "allocat", "พอร์ต", "น้ำหนัก"): "get_portfolio_summary",
-        ("regime", "bull", "bear", "neutral", "market", "สภาวะ", "ตลาด"):        "get_regime_summary",
-        ("price", "latest", "ราคา", "ล่าสุด", "หุ้น"):                           "get_live_quotes",
-    }
-    matched_tools = [tool for kws, tool in keywords_map.items() if any(k in msg_lower for k in kws)]
+    # No LLM: fail closed instead of keyword guessing or presenting raw results as an answer.
+    return ChatResponse(
+        reply=f"ยังตอบคำถามจากข้อมูลระบบไม่ได้ กรุณาตั้งค่า {('GEMINI_API_KEY' if provider == 'gemini' else 'OPENAI_API_KEY')} "
+              "และตรวจว่า openai SDK ติดตั้งแล้ว; ระบบจะไม่เดาคำตอบแทนข้อมูล",
+        tool_calls=[], tool_results=[])
 
-    if matched_tools:
-        for tool_name in matched_tools:
-            result = await execute_tool(tool_name, {})
-            tool_calls_log.append({"tool": tool_name, "args": {}})
-            tool_results_log.append({"tool": tool_name, "result": result})
-        reply = "⚠️ AI ไม่พร้อมใช้งานชั่วคราว — แสดงข้อมูลจากระบบแทน (ดูรายละเอียดในการ์ดด้านล่าง)"
-    else:
-        reply = ("สวัสดีครับ! ผมเป็น Quant AI Assistant ช่วยได้เรื่อง:\n"
-                 "- 📊 ดึงและอัพเดทข้อมูลราคาหุ้น\n- 💼 จัดพอร์ตด้วย MPT / หา Sharpe Ratio สูงสุด\n"
-                 "- 📈 วิเคราะห์สภาวะตลาด (Bull/Bear/Neutral)\n- 💰 ดูราคาหุ้นล่าสุด\n\n"
-                 "ลองถามว่า: 'จัดพอร์ตให้หน่อย' หรือ 'ตลาดตอนนี้เป็นยังไง'")
-
-    return ChatResponse(reply=reply, tool_calls=tool_calls_log, tool_results=tool_results_log)
 
 # ─────────────────────────────────────────────
 # ENTRY POINT
@@ -498,11 +820,3 @@ async def api_chat(req: ChatRequest, request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
-
-
-
-
-
