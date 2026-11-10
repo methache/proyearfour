@@ -22,12 +22,13 @@ export default function NewsFeed() {
   const [items, setItems]     = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError]     = useState(false)
+  const [source, setSource]   = useState('all')
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
     setLoading(true)
     setError(false)
     try {
-      const res = await api.news(24)
+      const res = await api.news(24, force)
       setItems(res?.items ?? [])
     } catch {
       setError(true)
@@ -38,13 +39,19 @@ export default function NewsFeed() {
 
   useEffect(() => { load() }, [load])
 
+  const visibleItems = items.filter(item => {
+    if (source === 'investing') return item.source === 'Investing.com'
+    if (source === 'yahoo') return item.source !== 'Investing.com'
+    return true
+  })
+
   return (
     <div className={s.wrap} data-testid="news-feed">
       <div className={s.header}>
         <h3>ข่าวล่าสุด</h3>
         <button
           className={s.refresh}
-          onClick={load}
+          onClick={() => load(true)}
           disabled={loading}
           data-testid="news-refresh-btn"
           aria-label="รีเฟรชข่าว"
@@ -56,6 +63,24 @@ export default function NewsFeed() {
             <polyline points="21 3 21 9 15 9" />
           </svg>
         </button>
+      </div>
+
+      <div className={s.sourceTabs} role="tablist" aria-label="แหล่งข่าว">
+        {[
+          ['all', 'ทั้งหมด'],
+          ['investing', 'Investing.com'],
+          ['yahoo', 'Yahoo Finance'],
+        ].map(([value, label]) => (
+          <button
+            key={value}
+            role="tab"
+            aria-selected={source === value}
+            className={source === value ? s.sourceTabActive : s.sourceTab}
+            onClick={() => setSource(value)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {loading ? (
@@ -74,13 +99,13 @@ export default function NewsFeed() {
         <div className={s.empty} data-testid="news-error">
           <p>โหลดข่าวไม่สำเร็จ ลองรีเฟรชอีกครั้ง</p>
         </div>
-      ) : items.length === 0 ? (
+      ) : items.length === 0 || visibleItems.length === 0 ? (
         <div className={s.empty}>
-          <p>ยังไม่มีข่าวในตอนนี้</p>
+          <p>{source === 'investing' ? 'ยังไม่มีข่าว Investing.com ในตอนนี้' : 'ยังไม่มีข่าวในตอนนี้'}</p>
         </div>
       ) : (
         <ul className={s.list} data-testid="news-list">
-          {items.map((n, i) => (
+          {visibleItems.map((n, i) => (
             <li key={n.id ?? i} className={`${s.item} anim-up`} style={{ animationDelay: `${i * 30}ms` }}>
               <a
                 href={n.url || '#'}
@@ -93,7 +118,7 @@ export default function NewsFeed() {
                   <img src={n.thumbnail} alt="" className={s.thumb} loading="lazy" />
                 ) : (
                   <div className={s.thumbFallback}>
-                    <span>{n.ticker}</span>
+                    <span>{n.source === 'Investing.com' ? 'INV' : n.ticker}</span>
                   </div>
                 )}
                 <div className={s.body}>

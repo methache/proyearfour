@@ -23,6 +23,21 @@
 }
 .refresh:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
 .refresh:disabled { opacity: 0.5; cursor: default; }
+.sourceTabs { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 1px; }
+.sourceTab,
+.sourceTabActive {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: .68rem;
+  cursor: pointer;
+}
+.sourceTab:hover,
+.sourceTabActive { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
 @keyframes spin360 { to { transform: rotate(360deg); } }
 .spin { animation: spin360 0.8s linear infinite; }
 

@@ -23,16 +23,20 @@ async function safeJson(res) {
 }
 
 /* ── core fetch ───────────────────────────────── */
-async function apiFetch(path, options = {}) {
+async function apiFetch(path, options = {}, timeoutMs = 15_000) {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 15_000)   // 15s timeout
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  const externalSignal = options.signal
+  const relayAbort = () => controller.abort(externalSignal?.reason)
+  if (externalSignal?.aborted) relayAbort()
+  else externalSignal?.addEventListener('abort', relayAbort, { once: true })
 
   try {
     const res = await fetch(path, {
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      signal: controller.signal,
       ...options,
+      signal: controller.signal,
     })
 
     clearTimeout(timeout)
@@ -51,9 +55,12 @@ async function apiFetch(path, options = {}) {
 
     return await safeJson(res)
   } catch (e) {
-    clearTimeout(timeout)
-    if (e.name === 'AbortError') throw new Error('Request timeout — backend ไม่ตอบสนอง')
+    if (externalSignal?.aborted) throw new Error('ยกเลิกคำขอแล้ว')
+    if (e.name === 'AbortError') throw new Error('ระบบใช้เวลาตอบนานเกินกำหนด กรุณาลองอีกครั้ง')
     throw e
+  } finally {
+    clearTimeout(timeout)
+    externalSignal?.removeEventListener('abort', relayAbort)
   }
 }
 
@@ -118,13 +125,35 @@ export const api = {
     apiFetch('/api/chat', {
       method: 'POST',
       body: JSON.stringify(body),
+    }, 180_000),
+
+  chatConversations: () =>
+    apiFetch('/api/chat/conversations'),
+
+  createChatConversation: () =>
+    apiFetch('/api/chat/conversations', { method: 'POST' }),
+
+  getChatConversation: (id) =>
+    apiFetch(`/api/chat/conversations/${encodeURIComponent(id)}`),
+
+  updateChatConversation: (id, body) =>
+    apiFetch(`/api/chat/conversations/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: JSON.stringify(body),
     }),
+
+  deleteChatConversation: (id) =>
+    apiFetch(`/api/chat/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  sendChatMessage: (id, message, signal) =>
+    apiFetch(`/api/chat/conversations/${encodeURIComponent(id)}/messages`, {
+      method: 'POST', body: JSON.stringify({ message }), signal,
+    }, 180_000),
 
   returnsHistory: (period = '1y') =>
     apiFetch(`/api/returns-history?period=${period}`),
 
-  news: (limit = 30) =>
-    apiFetch(`/api/news?limit=${limit}`),
+  news: (limit = 30, force = false) =>
+    apiFetch(`/api/news?limit=${limit}${force ? '&force=true' : ''}`, {}, 30_000),
 
   analysisMpt: () =>
     apiFetch('/api/analysis/mpt'),
