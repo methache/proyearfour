@@ -30,13 +30,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # โหลด .env ถ้ามี (ไม่ต้องติดตั้ง python-dotenv — อ่านไฟล์เอง)
-_env_path = Path(__file__).parent / ".env"
-if _env_path.exists():
-    for _line in _env_path.read_text().splitlines():
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+for _env_path in (Path(__file__).parent.parent / ".env", Path(__file__).parent / ".env"):
+    if _env_path.exists():
+        for _line in _env_path.read_text().splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
 
 # ─── optional LLM client (OpenAI SDK) ───
 try:
@@ -698,7 +698,10 @@ async def api_chat(req: ChatRequest):
             )
         return ChatResponse(reply=reply, tool_calls=tool_calls_log, tool_results=tool_results_log)
 
-    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    # Let a key in .env select its matching provider unless the user chose one.
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if not provider:
+        provider = "gemini" if os.getenv("GEMINI_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
     if provider == "gemini":
         api_key = os.getenv("GEMINI_API_KEY")
         base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -719,9 +722,10 @@ async def api_chat(req: ChatRequest):
         try:
             client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=165.0)
             system_prompt = (
-                "คุณคือผู้ช่วยตอบคำถามเกี่ยวกับข้อมูลลงทุนที่มีอยู่ในระบบ Quantix ตอบภาษาไทยเสมอ. "
-                "ตอบข้อเท็จจริงและตัวเลขได้เฉพาะเมื่อมี tool result รองรับเท่านั้น. "
-                "ห้ามใช้ความรู้ทั่วไป ความจำ หรือคาดเดาตัวเลข/สถานะ/เหตุผลแทนข้อมูลระบบ. "
+                "คุณคือผู้ช่วยของ Quantix ตอบภาษาไทยเสมอ. "
+                "ตอบคำถามทั่วไปและอธิบายแนวคิดการลงทุนด้วยความรู้ทั่วไปได้ โดยบอกข้อจำกัดเมื่อเหมาะสม. "
+                "ข้อมูลเฉพาะของผู้ใช้ พอร์ต ราคา ข่าวล่าสุด และตัวเลข/สถานะของระบบ ตอบได้เฉพาะเมื่อมี tool result รองรับเท่านั้น. "
+                "ห้ามเดาตัวเลขหรือสถานะของข้อมูลระบบ. "
                 "เมื่อผู้ใช้ขอ Min Volatility ให้เรียก optimize_portfolio ด้วย objective=min_vol; "
                 "เมื่อขอผลตอบแทนสูงสุดใช้ max_return; เมื่อขอ Sharpe สูงสุดใช้ max_sharpe. "
                 "ห้ามสรุปว่าเป้าหมายเหล่านี้ไม่มีในระบบเพียงเพราะ get_portfolio_summary แสดงพอร์ตหลักเป้าหมายเดียว. "
@@ -784,8 +788,9 @@ async def api_chat(req: ChatRequest):
                         else "เครื่องมือดึงข้อมูลสำเร็จ แต่โมเดลไม่ได้ส่งข้อความสรุปกลับมา ผลข้อมูลแสดงในการ์ดด้านล่างครับ"
                     )
             else:
-                final_reply = ("คำถามนี้ยังไม่มีข้อมูลจากเครื่องมือของระบบมารองรับ "
-                               "จึงไม่สามารถให้ข้อเท็จจริงหรือตัวเลขโดยไม่คาดเดาได้")
+                # For general questions the model can answer without a data tool.
+                # Keep personalized/system facts guarded by the tool-only rules above.
+                final_reply = (msg.content or "ขออภัยครับ ยังเรียบเรียงคำตอบไม่ได้ ลองถามอีกครั้งได้ไหม")
 
             return ChatResponse(reply=final_reply,
                                 tool_calls=tool_calls_log,
