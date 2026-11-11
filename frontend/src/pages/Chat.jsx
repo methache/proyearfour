@@ -29,6 +29,7 @@ const TOOL_LABELS = {
   optimize_portfolio:     'MPT Optimizer',
   classify_market_regime: 'Market Regime',
   get_portfolio_summary:  'Portfolio Summary',
+  get_my_portfolio:       'My Portfolio',
   get_regime_summary:     'Regime Summary',
   get_latest_prices:      'Latest Prices',
   run_data_pipeline:      'Data Pipeline',

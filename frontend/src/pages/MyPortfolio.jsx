@@ -50,7 +50,8 @@ export default function MyPortfolio() {
       const list = data?.portfolios || []
       setPortfolios(list)
       if (list.length && !activePortfolioId) {
-        setActivePortfolioId(list[0].id)
+        const savedId = localStorage.getItem('quantix.activePortfolio')
+        setActivePortfolioId(list.some(p => p.id === savedId) ? savedId : list[0].id)
       }
     } catch (e) {
       console.warn('failed to load portfolios:', e.message)
@@ -84,6 +85,10 @@ export default function MyPortfolio() {
     loadPortfolios()
     loadCustomTickers()
   }, [loadPortfolios, loadCustomTickers])
+
+  useEffect(() => {
+    if (activePortfolioId) localStorage.setItem('quantix.activePortfolio', activePortfolioId)
+  }, [activePortfolioId])
 
   useEffect(() => {
     if (activePortfolioId) loadHoldings()

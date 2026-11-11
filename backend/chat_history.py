@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth import _current_user, db
-from main import ChatRequest, api_chat
+from main import ChatRequest, chat_with_portfolio
 
 
 def _now() -> str:
@@ -51,6 +51,7 @@ class ConversationUpdate(BaseModel):
 
 class ChatMessageIn(BaseModel):
     message: str = Field(min_length=1, max_length=12000)
+    portfolio_id: str | None = Field(None, max_length=80)
 
 
 def register(app: FastAPI) -> None:
@@ -155,6 +156,32 @@ def register(app: FastAPI) -> None:
     ):
         user_id = await _user_id(request)
         conversation = await _owned_conversation(user_id, conversation_id)
+        # Resolve the requested portfolio against this authenticated user's data.
+        # If no selection was sent, use their first (default) portfolio.
+        from portfolio_manager import _find_portfolio, _get_or_init_portfolios
+        portfolios = await _get_or_init_portfolios(user_id)
+        selected = (
+            _find_portfolio(portfolios, body.portfolio_id)
+            if body.portfolio_id else (portfolios[0] if portfolios else None)
+        )
+        if body.portfolio_id and not selected:
+            raise HTTPException(status_code=404, detail="ไม่พบพอร์ตที่เลือก")
+        portfolio_context = None
+        if selected:
+            portfolio_context = {
+                "portfolio_id": selected.get("id"),
+                "portfolio_name": selected.get("name", "พอร์ตหลัก"),
+                "holdings": [
+                    {
+                        "ticker": str(item.get("ticker", "")).upper(),
+                        "shares": item.get("shares"),
+                        "buy_date": item.get("buyDate"),
+                        "buy_price_thb_per_share": item.get("buyPrice"),
+                        "buy_cost_thb": round(float(item.get("shares") or 0) * float(item.get("buyPrice") or 0), 2),
+                    }
+                    for item in selected.get("items", [])
+                ],
+            }
         now = _now()
 
         prior_cursor = db.chat_messages.find(
@@ -177,7 +204,9 @@ def register(app: FastAPI) -> None:
         })
 
         try:
-            response = await api_chat(ChatRequest(message=body.message, history=prior))
+            response = await chat_with_portfolio(
+                ChatRequest(message=body.message, history=prior), portfolio_context
+            )
             reply = response.reply.strip() or "ข้อมูลจากเครื่องมือแสดงด้านล่าง แต่โมเดลไม่ได้ส่งข้อความสรุปกลับมาครับ"
             tool_calls = response.tool_calls
             tool_results = response.tool_results

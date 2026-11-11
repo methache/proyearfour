@@ -146,7 +146,12 @@ export const api = {
 
   sendChatMessage: (id, message, signal) =>
     apiFetch(`/api/chat/conversations/${encodeURIComponent(id)}/messages`, {
-      method: 'POST', body: JSON.stringify({ message }), signal,
+      method: 'POST', body: JSON.stringify({
+        message,
+        portfolio_id: typeof localStorage !== 'undefined'
+          ? localStorage.getItem('quantix.activePortfolio')
+          : null,
+      }), signal,
     }, 180_000),
 
   returnsHistory: (period = '1y') =>

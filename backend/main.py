@@ -654,6 +654,15 @@ def _format_live_market_reply(result: dict) -> str:
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def api_chat(req: ChatRequest):
+    return await _api_chat(req, None)
+
+
+async def chat_with_portfolio(req: ChatRequest, portfolio_context: dict | None):
+    """Chat entry used by authenticated conversation routes after ownership checks."""
+    return await _api_chat(req, portfolio_context)
+
+
+async def _api_chat(req: ChatRequest, portfolio_context: dict | None):
     """
     LLM chat endpoint พร้อม Function Calling
     - คำตอบต้องอ้างอิง tool result เท่านั้น; ถ้าไม่มีหลักฐานให้ปฏิเสธการเดา
@@ -725,6 +734,7 @@ async def api_chat(req: ChatRequest):
                 "คุณคือผู้ช่วยของ Quantix ตอบภาษาไทยเสมอ. "
                 "ตอบคำถามทั่วไปและอธิบายแนวคิดการลงทุนด้วยความรู้ทั่วไปได้ โดยบอกข้อจำกัดเมื่อเหมาะสม. "
                 "ข้อมูลเฉพาะของผู้ใช้ พอร์ต ราคา ข่าวล่าสุด และตัวเลข/สถานะของระบบ ตอบได้เฉพาะเมื่อมี tool result รองรับเท่านั้น. "
+                "คำถามเกี่ยวกับพอร์ตส่วนตัว หุ้นที่ถือ จำนวนหุ้น วันที่ซื้อ หรือราคาซื้อ ให้เรียก get_my_portfolio เสมอ. "
                 "ห้ามเดาตัวเลขหรือสถานะของข้อมูลระบบ. "
                 "เมื่อผู้ใช้ขอ Min Volatility ให้เรียก optimize_portfolio ด้วย objective=min_vol; "
                 "เมื่อขอผลตอบแทนสูงสุดใช้ max_return; เมื่อขอ Sharpe สูงสุดใช้ max_sharpe. "
@@ -738,6 +748,16 @@ async def api_chat(req: ChatRequest):
                 "ผลตอบแทนย้อนหลังหรือผล backtest ไม่ใช่การรับประกันอนาคต."
             )
             messages = [{"role": "system", "content": system_prompt}]
+            llm_tools = list(TOOLS)
+            if portfolio_context is not None:
+                llm_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": "get_my_portfolio",
+                        "description": "อ่านข้อมูลจริงของพอร์ตที่ผู้ใช้เลือกใน My Portfolio รวม ticker, จำนวนหุ้น, วันที่ซื้อ, ราคาซื้อต่อหุ้น และต้นทุนรวม (THB)",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                    },
+                })
             # Never let client-supplied history add system/developer/tool messages.
             for item in req.history[-20:]:
                 role = item.get("role")
@@ -748,7 +768,7 @@ async def api_chat(req: ChatRequest):
 
             resp = await client.chat.completions.create(
                 model=model, messages=messages,
-                tools=TOOLS, tool_choice="auto", max_tokens=512,
+                tools=llm_tools, tool_choice="auto", max_tokens=512,
             )
             msg = resp.choices[0].message
             messages.append(msg.model_dump(exclude_none=True))
@@ -758,7 +778,15 @@ async def api_chat(req: ChatRequest):
                     fn_name = tc.function.name
                     fn_args = json.loads(tc.function.arguments or "{}")
                     tool_calls_log.append({"tool": fn_name, "args": fn_args})
-                    tool_result = await execute_tool(fn_name, fn_args)
+                    if fn_name == "get_my_portfolio":
+                        tool_result = {
+                            "status": "success",
+                            "source": "My Portfolio (บัญชีผู้ใช้ปัจจุบัน)",
+                            "as_of": "ข้อมูลที่บันทึกไว้ล่าสุด",
+                            **portfolio_context,
+                        }
+                    else:
+                        tool_result = await execute_tool(fn_name, fn_args)
                     tool_results_log.append({"tool": fn_name, "result": tool_result})
                     messages.append({
                         "role": "tool", "tool_call_id": tc.id,
