@@ -12,6 +12,10 @@ live.register(app)
 import auth  # noqa: E402, F401
 auth.register(app)
 
+# Register authenticated chat history and conversation management.
+import chat_history  # noqa: E402, F401
+chat_history.register(app)
+
 # Register aggregated portfolio news endpoint (Yahoo Finance).
 import news  # noqa: E402, F401
 news.register(app)
